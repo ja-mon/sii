@@ -18,6 +18,8 @@
 #include <ctype.h>
 #include <time.h>
 #include <unistd.h>
+#include <tls.h>
+#include <arpa/inet.h>
 
 #define EXIT_TIMEOUT 2
 
@@ -25,7 +27,8 @@
 #define PIPE_BUF _POSIX_PIPE_BUF
 #endif
 #define PING_TIMEOUT 300
-#define SERVER_PORT 6667
+#define SERVER_PORT "6697"
+
 enum { TOK_NICKSRV = 0, TOK_USER, TOK_CMD, TOK_CHAN, TOK_ARG, TOK_TEXT, TOK_LAST };
 
 typedef struct Channel Channel;
@@ -35,7 +38,9 @@ struct Channel {
 	Channel *next;
 };
 
-static int irc;
+static struct tls *irc = NULL;
+static int irc_fd;
+static struct tls_config *tlsconf = NULL;
 static time_t last_response;
 static Channel *channels = NULL;
 static char *host = "irc.freenode.net";
@@ -145,37 +150,99 @@ static void rm_channel(Channel *c) {
 	free(c);
 }
 
+static void tls_write_all(struct tls *conn, const char *buf, size_t len) {
+	while(len > 0) {
+		ssize_t ret = tls_write(conn, buf, len);
+		if(ret == TLS_WANT_POLLIN || ret == TLS_WANT_POLLOUT)
+			continue;
+		if(ret < 0) {
+			fprintf(stderr, "tls_write: %s\n", tls_error(conn));
+			exit(EXIT_FAILURE);
+		}
+		buf += ret;
+		len -= ret;
+	}
+}
+
 static void login(char *key, char *fullname) {
 	if(key) snprintf(message, PIPE_BUF,
 				"PASS %s\r\nNICK %s\r\nUSER %s localhost %s :%s\r\n", key,
 				nick, nick, host, fullname ? fullname : nick);
 	else snprintf(message, PIPE_BUF, "NICK %s\r\nUSER %s localhost %s :%s\r\n",
 				nick, nick, host, fullname ? fullname : nick);
-	write(irc, message, strlen(message));	/* login */
+
+	tls_write_all(irc, message, strlen(message)); /* login */
 }
 
-static int tcpopen(unsigned short port) {
-	int fd;
-	struct sockaddr_in sin;
-	struct hostent *hp = gethostbyname(host);
+static struct tls *tcpopen(const char *port) {
+	struct tls *conn = tls_client();
+	if(!conn) {
+		fputs("ii: tls_client() failed\n", stderr);
+		exit(EXIT_FAILURE);
+	}
+	if(tls_configure(conn, tlsconf) != 0) {
+		fprintf(stderr, "ii: tls_configure() failed: %s\n", tls_config_error(tlsconf));
+		exit(EXIT_FAILURE);
+	}
 
-	memset(&sin, 0, sizeof(struct sockaddr_in));
-	if(!hp) {
-		perror("ii: cannot retrieve host information");
+	struct addrinfo hints;
+	memset(&hints, 0, sizeof hints);
+	hints.ai_family = AF_UNSPEC;
+	hints.ai_socktype = SOCK_STREAM;
+	hints.ai_protocol = 0;
+	hints.ai_flags = AI_ADDRCONFIG;
+	int errorCode;
+	struct addrinfo *addresses;
+	do {
+		errorCode = getaddrinfo(host, port, &hints, &addresses);
+	} while(errorCode == EAI_AGAIN);
+
+	if(errorCode != 0) {
+		fprintf(stderr, "ii: getaddrinfo() failed: %s\n", gai_strerror(errorCode));
 		exit(EXIT_FAILURE);
 	}
-	sin.sin_family = AF_INET;
-	memcpy(&sin.sin_addr, hp->h_addr, hp->h_length);
-	sin.sin_port = htons(port);
-	if((fd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
-		perror("ii: cannot create socket");
-		exit(EXIT_FAILURE);
+
+	struct addrinfo *addr;
+	for(addr = addresses; addr; addr = addr->ai_next) {
+		char addr_string_buffer[INET6_ADDRSTRLEN];
+		const char *str_addr = inet_ntop(addr->ai_family, addr->ai_addr, addr_string_buffer, sizeof addr_string_buffer);
+
+		irc_fd = socket(addr->ai_family, addr->ai_socktype, addr->ai_protocol);
+		if(irc_fd == -1) {
+			fprintf(stderr, "ii: socket() on %s failed: %s\n",
+				str_addr,
+				strerror(errno));
+			continue;
+		}
+
+		if(connect(irc_fd, addr->ai_addr, addr->ai_addrlen) != 0) {
+			fprintf(stderr, "ii: connect() to %s failed: %s\n",
+				str_addr,
+				strerror(errno));
+			continue;
+		}
+
+		if(tls_connect_socket(conn, irc_fd, host) != 0) {
+			fprintf(stderr, "ii: tls_connect_socket() to %s failed: %s\n",
+				str_addr,
+				tls_error(conn));
+			continue;
+		}
+
+		if(tls_handshake(conn) == 0) {
+			break;
+		} else {
+			fprintf(stderr, "ii: tls_handshake() with %s failed: %s\n",
+				str_addr,
+				tls_error(conn));
+		}
 	}
-	if(connect(fd, (const struct sockaddr *) &sin, sizeof(sin)) < 0) {
-		perror("ii: cannot connect to host");
-		exit(EXIT_FAILURE);
-	}
-	return fd;
+
+	if(!addr)
+		exit(EXIT_FAILURE); // All addresses failed
+
+	freeaddrinfo(addresses);
+	return conn;
 }
 
 static size_t tokenize(char **result, size_t reslen, char *str, char delim) {
@@ -222,7 +289,7 @@ static void proc_channels_privmsg(char *channel, char *buf) {
 	snprintf(message, PIPE_BUF, "<%s> %s", nick, buf);
 	print_out(channel, message);
 	snprintf(message, PIPE_BUF, "PRIVMSG %s :%s\r\n", channel, buf);
-	write(irc, message, strlen(message));
+	tls_write_all(irc, message, strlen(message));
 }
 
 static void proc_channels_input(Channel *c, char *buf) {
@@ -276,7 +343,8 @@ static void proc_channels_input(Channel *c, char *buf) {
 			else
 				snprintf(message, PIPE_BUF,
 						"PART %s :ii - 500 SLOC are too much\r\n", c->name);
-			write(irc, message, strlen(message));
+			tls_write_all(irc, message, strlen(message));
+
 			close(c->fd);
 			/*create_filepath(infile, sizeof(infile), c->name, "in");
 			unlink(infile); */
@@ -291,7 +359,7 @@ static void proc_channels_input(Channel *c, char *buf) {
 		snprintf(message, PIPE_BUF, "%s\r\n", &buf[1]);
 
 	if (message[0] != '\0')
-		write(irc, message, strlen(message));
+		tls_write_all(irc, message, strlen(message));
 }
 
 static void proc_server_cmd(char *buf) {
@@ -342,7 +410,8 @@ static void proc_server_cmd(char *buf) {
 		return;
 	} else if(!strncmp("PING", argv[TOK_CMD], 5)) {
 		snprintf(message, PIPE_BUF, "PONG %s\r\n", argv[TOK_TEXT]);
-		write(irc, message, strlen(message));
+		tls_write_all(irc, message, strlen(message));
+
 		return;
 	} else if(!argv[TOK_NICKSRV] || !argv[TOK_USER]) {	/* server command */
 		snprintf(message, PIPE_BUF, "%s%s", argv[TOK_ARG] ? argv[TOK_ARG] : "", argv[TOK_TEXT] ? argv[TOK_TEXT] : "");
@@ -396,6 +465,19 @@ static int read_line(int fd, size_t res_len, char *buf) {
 	return 0;
 }
 
+static int tls_read_line(struct tls *conn, size_t res_len, char *buf) {
+	size_t i = 0;
+	char c = 0;
+	do {
+		if(tls_read(conn, &c, sizeof(char)) != sizeof(char))
+			return -1;
+		buf[i++] = c;
+	}
+	while(c != '\n' && i < res_len);
+	buf[i - 1] = 0;			/* eliminates '\n' */
+	return 0;
+}
+
 static void handle_channels_input(Channel *c) {
 	static char buf[PIPE_BUF];
 	if(read_line(c->fd, PIPE_BUF, buf) == -1) {
@@ -412,8 +494,8 @@ static void handle_channels_input(Channel *c) {
 
 static void handle_server_output() {
 	static char buf[PIPE_BUF];
-	if(read_line(irc, PIPE_BUF, buf) == -1) {
-		perror("ii: remote host closed connection");
+	if(tls_read_line(irc, PIPE_BUF, buf) == -1) {
+		fprintf(stderr, "ii: remote host closed connection: %s\n", tls_error(irc));
 		exit(EXIT_FAILURE);
 	}
 	proc_server_cmd(buf);
@@ -429,8 +511,8 @@ static void run() {
 	snprintf(ping_msg, sizeof(ping_msg), "PING %s\r\n", host);
 	for(;;) {
 		FD_ZERO(&rd);
-		maxfd = irc;
-		FD_SET(irc, &rd);
+		maxfd = irc_fd;
+		FD_SET(irc_fd, &rd);
 		for(c = channels; c; c = c->next) {
 			if(maxfd < c->fd)
 				maxfd = c->fd;
@@ -450,10 +532,10 @@ static void run() {
 				print_out(NULL, "-!- ii shutting down: ping timeout");
 				exit(EXIT_TIMEOUT);
 			}
-			write(irc, ping_msg, strlen(ping_msg));
+			tls_write_all(irc, ping_msg, strlen(ping_msg));
 			continue;
 		}
-		if(FD_ISSET(irc, &rd)) {
+		if(FD_ISSET(irc_fd, &rd)) {
 			handle_server_output();
 			last_response = time(NULL);
 		}
@@ -467,7 +549,7 @@ static void run() {
 
 int main(int argc, char *argv[]) {
 	int i;
-	unsigned short port = SERVER_PORT;
+	const char *port = SERVER_PORT;
 	struct passwd *spw = getpwuid(getuid());
 	char *key = NULL, *fullname = NULL;
 	char prefix[_POSIX_PATH_MAX];
@@ -478,13 +560,40 @@ int main(int argc, char *argv[]) {
 	}
 	snprintf(nick, sizeof(nick), "%s", spw->pw_name);
 	snprintf(prefix, sizeof(prefix),"%s/irc", spw->pw_dir);
-	if (argc <= 1 || (argc == 2 && argv[1][0] == '-' && argv[1][1] == 'h')) usage();
+	if(argc <= 1 || (argc == 2 && argv[1][0] == '-' && argv[1][1] == 'h')) usage();
+
+	if(tls_init() != 0) {
+		fputs("ii: tls_init() failed\n", stderr);
+		exit(EXIT_FAILURE);
+	}
+	tlsconf = tls_config_new();
+	if(!tlsconf) {
+		fputs("ii: tls_config_new() failed\n", stderr);
+		exit(EXIT_FAILURE);
+	}
+
+
+	uint32_t tls_protocols;
+	if(tls_config_parse_protocols(&tls_protocols, "legacy") != 0) {
+		fputs("ii: tls_config_parse_protocols() failed\n", stderr);
+		exit(EXIT_FAILURE);
+	}
+
+	// void return, wtf?
+	tls_config_set_protocols(tlsconf, tls_protocols);
+//	tls_config_set_protocols(tlsconf, TLS_PROTOCOL_TLSv1_2);
+	/*
+	if(tls_config_set_protocols(tlsconf, tls_protocols) != 0) {
+		fprintf(stderr, "ii: tls_config_set_protocols() failed: %s\n", tls_config_error(tlsconf));
+		exit(EXIT_FAILURE);
+	}
+	*/
 
 	for(i = 1; (i + 1 < argc) && (argv[i][0] == '-'); i++) {
 		switch (argv[i][1]) {
 			case 'i': snprintf(prefix,sizeof(prefix),"%s", argv[++i]); break;
 			case 's': host = argv[++i]; break;
-			case 'p': port = strtol(argv[++i], NULL, 10); break;
+			case 'p': port = argv[++i]; break;
 			case 'n': snprintf(nick,sizeof(nick),"%s", argv[++i]); break;
 			case 'k': key = getenv(argv[++i]); break;
 			case 'f': fullname = argv[++i]; break;
@@ -492,9 +601,9 @@ int main(int argc, char *argv[]) {
 		}
 	}
 	irc = tcpopen(port);
-	
+
 	#ifdef __OpenBSD__	/* OpenBSD pledge(2) support */
-		if (pledge("stdio rpath wpath cpath dpath", NULL) == -1) {
+		if(pledge("stdio rpath wpath cpath dpath", NULL) == -1) {
 			fprintf(stderr, "ii pledge: %s\n", strerror(errno));
 			exit(EXIT_FAILURE);
 		}
